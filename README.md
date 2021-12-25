@@ -5,7 +5,7 @@
 - [youjiali1995](https://github.com/youjiali1995): TiDB 分布式事务研发工程师
 - [sticnarf](https://github.com/sticnarf): TiDB 分布式事务研发工程师 
 
-## 介绍
+## 项目介绍
 
 Better TiKV!!!
 
