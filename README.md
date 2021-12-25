@@ -40,7 +40,7 @@ rocksdb 无法很好的利用现代高速硬盘，因为它的 foreground write(
 
 为了优化 TiKV 的 disk 使用，raft engine 需要支持并发写 WAL 或者拆分 raft db 来并行写多个 WAL 文件，为了更公平的和 upstream TiKV 做性能对比，本次 hackathon 不会对数据模型做很大改动，会实现并行写 WAL，不会拆分 raft db。为了最大化 disk 的压力、更好的 CPU 使用率、更好的性能稳定性，选择使用 async I/O 来实现该功能。
 
-store pool 实现了上述功能后，它的性能应该会大幅优于 apply pool，但可能会消耗更多的资源从而影响整体的性能，如消耗了更多的 disk I/O 资源导致 apply pool 变慢、积攒太多 committed logs 导致 OOM 等，且整个 pipeline 的性能受限于最慢的一个阶段，需要根据最慢的阶段做 back pressure，如调整 store pool 和 apply pool 的线程数量从而保证速度匹配。但拆分多个线程池实在是不易用、不灵活，为了避免手动调优，我们会将 store pool 和 apply pool 合并为单个线程池，为了实现这一目标，raft engine 使用 async I/O 也是必须的，kv db 同样需要使用 async I/O，但 kv db 理论上可以不写 WAL，因为数据可通过 raft log 回放且该功能已有方案，在 hackathon 上会强行去掉 kv db 的 WAL。除了 async I/O 外，还需要实现 CPU scheduler 来保证单个线程内不同任务成比例地使用资源，如原来 store pool 和 apply pool 的任务各使用 50% 的 CPU 资源。
+store pool 实现了上述功能后，它的性能应该会大幅优于 apply pool，但可能会消耗更多的资源从而影响整体的性能，如消耗了更多的 CPU 和 disk I/O 资源导致 apply pool 变慢、积攒太多 committed logs 导致 OOM 等，且整个 pipeline 的性能受限于最慢的一个阶段，需要根据最慢的阶段做 back pressure，如调整 store pool 和 apply pool 的线程数量从而保证速度匹配。但拆分多个线程池实在是不易用、不灵活，为了避免手动调优，我们会将 store pool 和 apply pool 合并为单个线程池，为了实现这一目标，raft engine 使用 async I/O 也是必须的，kv db 同样需要使用 async I/O，但 kv db 理论上可以不写 WAL，因为数据可通过 raft log 回放且该功能已有方案，在 hackathon 上会强行去掉 kv db 的 WAL。除了 async I/O 外，还需要实现 CPU scheduler 来保证当 CPU 成为**瓶颈**时单个线程内不同任务成比例地使用资源，如原来 store pool 和 apply pool 的任务各使用 50% 的 CPU 资源。
 
 有了 CPU scheduler 后可以把更多的线程池合并在一起从而实现真正的 unified thread pool，如 gRPC thread pool、scheduler worker pool、unified read pool、rocksdb background threads、backup thread pool 等，CPU scheduler 会给每个原先 thread pool 的任务分配一定比例的资源，且可动态调整，从而提升资源紧张时的性能稳定性、实现自适应和避免手动调参。
 
