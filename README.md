@@ -30,7 +30,7 @@ TiDB 的写入性能和性能稳定性一直被人吐槽，主要原因在 TiKV�
 
 ## 详细设计
 
-TiKV 目前使用经典的 [SEDA](https://en.wikipedia.org/wiki/Staged_event-driven_architecture) 线程模型，它的缺点在 FAQ 里会提到，这里只介绍写入路径上最关键组件的问题 —— raft store。raft store 包含两个 thread pool：store pool 用于处理 raft message、append log 等，raft log 会写入 raft db；apply pool 用于处理 committed log，数据会写入 kv db，目前 raft db 和 kv db 均使用 [rocksdb](https://github.com/tikv/rocksdb)，之后 raft db 会切换到 [raft engine](https://github.com/tikv/raft-engine)。
+TiKV 目前使用经典的 [SEDA](https://en.wikipedia.org/wiki/Staged_event-driven_architecture) 线程模型，它的缺点在 FAQ 里会提到，这里只介绍写入路径上最关键组件的问题 —— raft store。raft store 包含两个 thread pool：store pool 用于处理 raft message、append log 等，raft log 会写入 raft db；apply pool 用于处理 committed log，数据会写入 kv db，目前 raft db 和 kv db 均使用 [rocksdb](https://github.com/tikv/rocksdb)，之后 raft db 会切换到 [raft-engine](https://github.com/tikv/raft-engine)。
 
 ![tikv](./media/tikv.png)
 
@@ -40,11 +40,29 @@ rocksdb 无法很好的利用现代高速硬盘，因为它的 foreground write(
 
 为了优化 TiKV 的 disk 使用，raft engine 需要支持并发写 WAL 或者拆分 raft db 来并行写多个 WAL 文件，为了更公平的和 upstream TiKV 做性能对比，本次 hackathon 不会对数据模型做很大改动，会实现并行写 WAL，不会拆分 raft db。为了最大化 disk 的压力、更好的 CPU 使用率、更好的性能稳定性，选择使用 async I/O 来实现该功能。
 
-store pool 实现了上述功能后，它的性能应该会大幅优于 apply pool，但可能会消耗更多的资源从而影响整体的性能，如消耗了更多的 CPU 和 disk I/O 资源导致 apply pool 变慢、积攒太多 committed logs 导致 OOM 等，且整个 pipeline 的性能受限于最慢的一个阶段，需要根据最慢的阶段做 back pressure，如调整 store pool 和 apply pool 的线程数量从而保证速度匹配。但拆分多个线程池实在是不易用、不灵活，为了避免手动调优，我们会将 store pool 和 apply pool 合并为单个线程池，为了实现这一目标，raft engine 使用 async I/O 也是必须的，kv db 同样需要使用 async I/O，但 kv db 理论上可以不写 WAL，因为数据可通过 raft log 回放且该功能已有方案，在 hackathon 上会强行去掉 kv db 的 WAL。除了 async I/O 外，还需要实现 CPU scheduler 来保证当 CPU 成为**瓶颈**时单个线程内不同任务成比例地使用资源，如原来 store pool 和 apply pool 的任务各使用 50% 的 CPU 资源。
+store pool 实现了上述功能后，它的性能应该会大幅优于 apply pool，但可能会消耗更多的资源从而影响整体的性能，如消耗了更多的 CPU 和 disk I/O 资源导致 apply pool 变慢、积攒太多 committed logs 导致 OOM 等，且整个 pipeline 的性能受限于最慢的一个阶段，需要根据最慢的阶段做 back pressure，如调整 store pool 和 apply pool 的线程数量从而保证速度匹配。但拆分多个线程池实在是不易用、不灵活，为了避免手动调优，我们会将 store pool 和 apply pool 合并为单个线程池，为了实现这一目标，raft engine 使用 async I/O 也是必需的，kv db 同样需要使用 async I/O，但 kv db 理论上可以不写 WAL，因为数据可通过 raft log 回放且该功能已有方案，在 hackathon 上会强行去掉 kv db 的 WAL。除了 async I/O 外，还需要实现 CPU scheduler 来保证当 CPU 成为**瓶颈**时单个线程内不同任务成比例地使用资源，如原来 store pool 和 apply pool 的任务各使用 50% 的 CPU 资源。
 
 有了 CPU scheduler 后可以把更多的线程池合并在一起从而实现真正的 unified thread pool，如 gRPC thread pool、scheduler worker pool、unified read pool、rocksdb background threads、backup thread pool 等，CPU scheduler 会给每个原先 thread pool 的任务分配一定比例的资源，且可动态调整，从而提升资源紧张时的性能稳定性、实现自适应和避免手动调参。
 
-### raft engine parallel WAL
+### raft-engine parallel log
+
+目前 [raft-engine](https://github.com/tikv/raft-engine/commit/dce6c225bec148146749780dc4debcffb373990a) 类似 bitcask 的实现：
+
+- 所有 raft group 的 log 都顺序写入当前 log file 中，当 log file 到达一定大小后会切换到新的 log file；在 memtable 中维护了所有 raft group 部分 raft log 所属的文件和文件地址。
+- 写 log 的流程类似 rocksdb，会由 write group leader 写入所有 writer 的数据，但目前需要调用多次 `pwrite()` 和一次 `fdatasync()`。
+- 需要主动调用 [`Engine::compact_to()`](https://github.com/tikv/raft-engine/blob/dce6c225bec148146749780dc4debcffb373990a/src/engine.rs#L254) 标记清理无用的 raft log、主动调用 [`Engine::purge_expired_files()`](https://github.com/tikv/raft-engine/blob/dce6c225bec148146749780dc4debcffb373990a/src/engine.rs#L208) 清理磁盘上无用的数据。
+
+为了支持 parallel log，我们会将 log file 划分为固定 4KiB 大小的 page，每次写入以 page 为单位，数据格式不发生变化（已有 checksum 来保证数据的正确和完整性）。I/O 方式选择 `O_DIRECT | O_DSYNC` 以支持 async I/O，log file 会预先分配阈值大小来避免 `O_DSYNC` 每次写入都需要修改 metadata。并发的写 log 请求不会组成 write group，每个请求单独写入，会使用 atomic log page allocation（人话是单个原子变量）来分配不重叠的、连续的 page，当分配的 page 超出 log file 大小时，需要切换到新的 log file，使用锁来实现。数据恢复时会以 page 为单位遍历 log file 所有的数据以防止 log file 中有空洞（hackathon 可以不做）。
+
+####  open questions
+
+- `O_DSYNC` 可能需要是 write-through disk，而且只 `fallocate()` 足够吗？[commitlog: Add optional use of O_DSYNC mode](https://github.com/scylladb/scylla/commit/1e37e1d40c78cb3c86ff5ce33d3a58dce5670b1f#diff-58f71059b7c89ad959d4d27d9e921026bb0a2fd5c8d74773423df48139d9c69dR1267-R1269) 可能最好是复用 log file 来避免 `open()`、`fallocate()` 及 sync dir，但需要修改数据格式包含当前 active file number 来区分旧数据。
+
+- 支持 write group logging 来增大 batch？使用 `O_DIRECT | O_DSYNC` 的 I/O 方式，write group logging 在当前 raft-engine 实现下没有任何帮助，不过可以优化为单次 write，但如果支持 async I/O 需要在 glommio 中跨线程 wake。
+
+- [`Engine::fetch_entries_to()`](https://github.com/tikv/raft-engine/blob/dce6c225bec148146749780dc4debcffb373990a/src/engine.rs#L215) 仍使用 buffer I/O，会不会有奇怪的影响？但很容易实现为 direct I/O 且增加 entry cache 大小来缓解。
+
+- 修改 gc 的 I/O 方式，不过 raft log gc 的工作在 TiKV 中由单独的线程完成，本次 hackathon 不需要解决。
 
 ### async I/O + store pool
 
@@ -57,7 +75,6 @@ store pool 实现了上述功能后，它的性能应该会大幅优于 apply po
 ## 缺点
 
 - 追求极致的性能需要数据也按线程划分，但单线程热点不好解决，可以退一步到不划分数据，只是线程为 SMP 模型。 
-
 - 工程难度太高，所有组件都要自己实现。
 - `io_uring` 对 kernel 版本有要求，但 linux AIO 能达到相同的效果。
 
