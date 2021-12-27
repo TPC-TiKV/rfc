@@ -64,13 +64,57 @@ store pool 实现了上述功能后，它的性能应该会大幅优于 apply po
 
 - 修改 gc 的 I/O 方式，不过 raft log gc 的工作在 TiKV 中由单独的线程完成，本次 hackathon 不需要解决。
 
-### async I/O + store pool
+### async I/O + async store batch system
+
+raft-engine 依赖 [glommio](https://github.com/DataDog/glommio) 来提供异步接口，store pool 也会使用 glommio runtime。
+
+#### 单个 raft group 的流程
+
+有了 async ready 后理想的流程：
+
+1. batch system 接收到 raft group，处理一批 messages。
+2. 获取 raft group ready，发送 messages 给其他 peer、发送 committed entries 给 apply batch system、生成 `WriteTask` 并 `advance_append_async()`。
+3. 生成的 `WriteTask` 会在 batch system end 中合并、异步写入。
+4. 该 raft group 仍可以处理 messages、生成 ready 并异步写入，不需要等待第 3 步完成。
+5. 对异步写入完成的 ready 调用 `on_persist_ready()`，该接口需要升序调用，但不需要顺序递增。
+
+batch system 在接收到 raft group 后 spawn 出处理该 raft group 的 future，在 end 里 spawn 出 `join_all()` 这一批 future 并异步写入 log 的 future，写入完成会对这一批 raft group 调用 `on_persist_ready()`。
+
+由于 batch system 需要先从 `fsm_receiver` 里获取到 raft goup 才会处理它的消息，而第三步异步写入 raft log 可能会将该 raft goup 绑定在当前线程，不会出现在 `fsm_receiver` 里，导致单个 raft group 的流程仍是串行模式。解决方案有：
+
+1. 将 raft group 接收消息也改为 future，当有 ready 未写入完成时 spawn 出接收并处理消息的 future。
+
+2. 保留异步写 log 完成发送 `PeerMsg::Persisted` 的机制，异步写 log 的 future 不包含 fsm 的所有权，就可以扔回 `fsm_receiver` 继续接收、处理后续消息。当 region 收到 `PeerMsg::Persisted` 消息后使用类似 TCP 滑动窗口的方式保存完成的 ready number，没有空洞后使用最后一个 ready number 调用 `on_persist_ready()`。
+
+#### batch system 改造
+
+batch system 会卡在 `fsm_receiver` 上，glommio 需要定期 poll I/O 而且有可能 sleep，需要改造 batch system 来适配。最理想的情况是 glommio 提供 `Poller` trait，batch system 实现该 trait 并由 glommio 定期调用，但目前无这样的机制。可以选择将 batch system 异步化作为 root future，有新的 raft group 要处理时需要唤醒 glommio 防止它 sleep。
+
+#### 未解决的同步行为
+
+store batch system 会阻塞的地方：
+
+- store fsm:
+  - `StoreTick::SnapGc`：会遍历 snapshot dir，但我们不会生成 snapshot（用 1 或 3 台 TiKV）。
+  - `on_raft_message`：会读 kvdb 获取 region state。
+  - `StoreMsg::CreatePeer`：会读写 kvdb。
+- peer fsm:
+  - leader 复制 raft log 可能会读 raft engine，要改的话需要改 raft-rs。（理想情况下不会发生，包括 apply 里获取 committed entries）
+  - snapshot 相关的元信息会写 kv db，但我们会把 kv db WAL 去掉。
 
 ### CPU scheduler
 
+TODO：https://youjiali1995.github.io/scylladb/cpu-scheduler/
+
 ### unified raft store
 
+1. kv db 去掉 WAL 变为纯计算逻辑，不需要 join write group 和 multi batch write。
+2. glommio 中创建 2 个 task queue 分别给 store batch system 和 apply batch system 使用，通过 shares 控制 CPU 使用比例。
+3. raft group 发送 committed entries 改为 spawn 写入 kv db 的 future 到 apply batch system task queue。（需要 peer fsm 里包含对应的 apply fsm）
+
 ### unified thread pool
+
+TODO
 
 ## 缺点
 
@@ -90,3 +134,7 @@ store pool 实现了上述功能后，它的性能应该会大幅优于 apply po
 
 ## Task
 
+- [ ] raft engine parallel log + async interface @[sticnarf](https://github.com/sticnarf)
+- [ ] async store batch system @[youjiali1995](https://github.com/youjiali1995)
+- [ ] kvdb remove WAL
+- [ ] unify store batch system and apply batch system
