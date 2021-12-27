@@ -49,14 +49,14 @@ store pool 实现了上述功能后，它的性能应该会大幅优于 apply po
 目前 [raft-engine](https://github.com/tikv/raft-engine/commit/dce6c225bec148146749780dc4debcffb373990a) 类似 bitcask 的实现：
 
 - 所有 raft group 的 log 都顺序写入当前 log file 中，当 log file 到达一定大小后会切换到新的 log file；在 memtable 中维护了所有 raft group 部分 raft log 所属的文件和文件地址。
-- 写 WAL 的流程类似 rocksdb，会由 write group leader 写入所有 writer 的数据，但目前需要调用多次 `pwrite()` 和一次 `fdatasync()`。
+- 写 log 的流程类似 rocksdb，会由 write group leader 写入所有 writer 的数据，但目前需要调用多次 `pwrite()` 和一次 `fdatasync()`。
 - 需要主动调用 [`Engine::compact_to()`](https://github.com/tikv/raft-engine/blob/dce6c225bec148146749780dc4debcffb373990a/src/engine.rs#L254) 标记清理无用的 raft log、主动调用 [`Engine::purge_expired_files()`](https://github.com/tikv/raft-engine/blob/dce6c225bec148146749780dc4debcffb373990a/src/engine.rs#L208) 清理磁盘上无用的数据。
 
-为了支持 parallel log，我们会将 log file 划分为固定 4KiB 大小的 page，每次写入以 page 为单位，数据格式不发生变化（已有 checksum 来保证数据的正确和完整性）。I/O 方式选择 `O_DIRECT | O_DSYNC` 以支持 async I/O，log file 会预先分配阈值大小来避免 `O_DSYNC` 每次写入都需要修改 metadata。并发的写 log 请求不会组成 write group，每个请求单独写入，会使用 atomic log page allocation（人话是单个原子变量）来分配不重叠的、连续的 page，数据恢复时会以 page 为单位遍历 log file 所有的数据以防止 log file 中有空洞（hackathon 可以不做）。当分配的 page 超出 log file 大小时，需要切换到新的 log file，使用锁来实现。 
+为了支持 parallel log，我们会将 log file 划分为固定 4KiB 大小的 page，每次写入以 page 为单位，数据格式不发生变化（已有 checksum 来保证数据的正确和完整性）。I/O 方式选择 `O_DIRECT | O_DSYNC` 以支持 async I/O，log file 会预先分配阈值大小来避免 `O_DSYNC` 每次写入都需要修改 metadata。并发的写 log 请求不会组成 write group，每个请求单独写入，会使用 atomic log page allocation（人话是单个原子变量）来分配不重叠的、连续的 page，当分配的 page 超出 log file 大小时，需要切换到新的 log file，使用锁来实现。数据恢复时会以 page 为单位遍历 log file 所有的数据以防止 log file 中有空洞（hackathon 可以不做）。
 
 ####  open questions
 
-- `O_DSYNC` 可能需要是 write-through disk，而且只 `ftruncate()` 足够吗？[commitlog: Add optional use of O_DSYNC mode](https://github.com/scylladb/scylla/commit/1e37e1d40c78cb3c86ff5ce33d3a58dce5670b1f#diff-58f71059b7c89ad959d4d27d9e921026bb0a2fd5c8d74773423df48139d9c69dR1267-R1269) 可能最好是复用 log file 来避免 `open()`、`fallocate()` 及 sync dir，但需要修改数据格式包含当前 active file number 来区分旧数据。
+- `O_DSYNC` 可能需要是 write-through disk，而且只 `fallocate()` 足够吗？[commitlog: Add optional use of O_DSYNC mode](https://github.com/scylladb/scylla/commit/1e37e1d40c78cb3c86ff5ce33d3a58dce5670b1f#diff-58f71059b7c89ad959d4d27d9e921026bb0a2fd5c8d74773423df48139d9c69dR1267-R1269) 可能最好是复用 log file 来避免 `open()`、`fallocate()` 及 sync dir，但需要修改数据格式包含当前 active file number 来区分旧数据。
 
 - 支持 write group logging 来增大 batch？使用 `O_DIRECT | O_DSYNC` 的 I/O 方式，write group logging 在当前 raft-engine 实现下没有任何帮助，不过可以优化为单次 write，但如果支持 async I/O 需要在 glommio 中跨线程 wake。
 
