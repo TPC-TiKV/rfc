@@ -88,7 +88,7 @@ batch system 在接收到 raft group 后 spawn 出处理该 raft group 的 futur
 
 #### batch system 改造
 
-batch system 会卡在 `fsm_receiver` 上，glommio 需要定期 poll I/O 而且有可能 sleep，需要改造 batch system 来适配。最理想的情况是 glommio 提供 `Poller` trait，batch system 实现该 trait 并由 glommio 定期调用，但目前无这样的机制。可以选择将 batch system 异步化作为 root future，有新的 raft group 要处理时需要唤醒 glommio 防止它 sleep。
+batch system 会卡在 `fsm_receiver` 上，glommio 需要定期 poll I/O 而且有可能 sleep，需要改造 batch system 来适配。最理想的情况是 glommio 提供 `Poller` trait，batch system 实现该 trait 并由 glommio 定期调用，但目前无这样的机制。可以选择将 batch system 异步化作为 root future，有新的 raft group 要处理时就唤醒 glommio 防止它 sleep。
 
 #### 未解决的同步行为
 
@@ -116,6 +116,10 @@ TODO：https://youjiali1995.github.io/scylladb/cpu-scheduler/
 
 TODO
 
+### multi-tenant
+
+TODO
+
 ## 缺点
 
 - 追求极致的性能需要数据也按线程划分，但单线程热点不好解决，可以退一步到不划分数据，只是线程为 SMP 模型。 
@@ -134,7 +138,55 @@ TODO
 
 ## Task
 
-- [ ] raft engine parallel log + async interface @[sticnarf](https://github.com/sticnarf)
-- [ ] async store batch system @[youjiali1995](https://github.com/youjiali1995)
-- [ ] kvdb remove WAL
-- [ ] unify store batch system and apply batch system
+- [x] raft engine parallel log + async interface @[sticnarf](https://github.com/sticnarf) [[Support async write #1]](https://github.com/TPC-TiKV/raft-engine/pull/1)
+- [x] async store batch system @[youjiali1995](https://github.com/youjiali1995) [[async store batch system #1]](https://github.com/TPC-TiKV/tikv/pull/1)
+- [x] kvdb remove WAL @[youjiali1995](https://github.com/youjiali1995) [[remove kvdb wal #2]](https://github.com/TPC-TiKV/tikv/pull/2)
+- [x] unify store batch system and apply batch system @[youjiali1995](https://github.com/youjiali1995) [[unify store and apply batch system #3]](https://github.com/TPC-TiKV/tikv/pull/3)
+- [ ] multi-tenant
+
+## Benchmark
+
+### 环境
+
+- 机器：
+  - TiDB/go-ycsb：1 * c5.9xlarge
+  - TiKV：1(or 3) * i3.4xlarge(or i3.8xlarge，看 CPU 是否够用)，有时间再测 ebs。
+  - PD ：1 * c5.xlarge
+- file system：xfs（对 async I/O 支持最好）
+- block device 配置：
+  - `queue/scheduler`：none
+  - `queue/nomerges`：2（disable merge）
+  - `queue/write_cache`：确认是否为 write through
+  - `queue/nr_requests`：调大
+- RAID 0 或者 raftdb、kvdb 分盘部署，需要测试：`io_uring` 目前不支持 poll md，仍通过中断通知。([raid0 vs io_uring](https://lore.kernel.org/all/ee22cbab-950f-cdb0-7ef0-5ea0fe67c628@kernel.dk/t/), [md: add support for REQ_NOWAIT](https://lore.kernel.org/all/20211221200622.29795-1-vverma@digitalocean.com/))
+- irqbalance?
+
+### Config
+
+TPC
+
+```yaml
+tikv:
+    raftstore.store-pool-size: 8 # 它控制合并后的 raftstore 线程数量，可能越大越好，需要 tune
+    raftstore.store-io-pool-size: 0 # TPC 实现依赖它为 0 
+    raft-engine.enable: true
+    rocksdb.disable-wal: true
+```
+
+master
+
+```yaml
+tikv:
+    raftstore.store-pool-size: 4 # 需要 tune
+    raftstore.apply-pool-size: 4 # 需要 tune
+    raftstore.store-io-pool-size: 1 # async-io，需要 tune
+    raft-engine.enable: true
+    rocksdb.disable-wal: true
+```
+
+### Workload
+
+- rawkv ycsb 纯写：期望效果最好的场景。
+- txnkv ycsb
+- sysbench
+
